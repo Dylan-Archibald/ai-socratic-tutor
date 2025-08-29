@@ -1,1 +1,189 @@
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import List, Tuple, Dict, Optional
+import re
+import unittest
+import random
+
+BLOOM_OPENERS = (
+    "why", "how", "what", "explain", "compare", "contrast", "predict",
+    "justify", "analyze", "evaluate", "design", "derive"
+)
+
+# --- Domain hints for a few topics (kept tiny on purpose) ---
+DOMAIN_CONCEPTS: Dict[str, List[str]] = {
+    "algebra": ["linear equation", "slope", "intercept", "variable", "solve"],
+    "calculus": ["limit", "derivative", "rate of change", "slope", "tangent"],
+    "statistics": ["mean", "median", "variance", "distribution", "sample"],
+    "physics": ["force", "mass", "acceleration", "energy", "momentum"],
+}
+
+@dataclass
+class DialogueTurn:
+    role: str  # "tutor" or "student"
+    text: str
+
+@dataclass
+class DialogueState:
+    topic: str = "general"
+    difficulty: int = 2  # 1..5
+    target_concepts: List[str] = field(default_factory=list)
+    history: List[DialogueTurn] = field(default_factory=list)
+    turns_since_meta: int = 0
+
+    def push(self, role: str, text: str):
+        self.history.append(DialogueTurn(role=role, text=text))
+
+    @property
+    def last_student(self) -> Optional[str]:
+        for turn in reversed(self.history):
+            if turn.role == "student":
+                return turn.text
+        return None
+
+class SocraticTutor:
+    def __init__(self, max_len: int = 220):
+        self.max_len = max_len
+
+    # ---------------- Core generation -----------------
+    def generate_question(self, state: DialogueState) -> str:
+        topic = state.topic.lower()
+        domain = DOMAIN_CONCEPTS.get(topic, [])
+        base_verbs = BLOOM_OPENERS
+
+        # Increase cognitive demand with difficulty
+        verb = base_verbs[min(len(base_verbs)-1, state.difficulty + 1)]
+
+        # Use student context if available
+        follow = self._followup_clause(state)
+
+        # Occasionally insert metacognitive prompt
+        state.turns_since_meta += 1
+        if state.turns_since_meta >= 3:
+            state.turns_since_meta = 0
+            return self._truncate(
+                f"Before we continue, {self._metacognitive_prompt(state)}"
+            )
+
+        # Topic‑aware stem
+        if domain:
+            concept = random.choice(domain)
+            q = f"{verb.capitalize()} {topic}: {follow} focusing on the idea of '{concept}'."
+        else:
+            q = f"{verb.capitalize()} your approach: {follow} and outline your next step."
+
+        # Make sure it ends as a question
+        if not q.strip().endswith("?"):
+            q = q.rstrip(".") + "?"
+        return self._truncate(q)
+
+    # ---------------- Heuristics & helpers -----------------
+    def _followup_clause(self, state: DialogueState) -> str:
+        last = (state.last_student or "").strip()
+        if not last:
+            return "start by describing what the question is asking"
+        # If student gave a formula or number, nudge them to connect reasoning
+        if re.search(r"\\b(=|\\d+|\\+|−|-|\\*|/|%|\\^)\\b", last):
+            return "connect each calculation to a reason"
+        # If student expressed uncertainty
+        if re.search(r"i (don\'t|do not) (know|get|understand)", last, re.I):
+            return "identify which part feels unclear and why"
+        # Default: build on their prior statement
+        return f"build on your last idea (‘{last[:40]}{'…' if len(last)>40 else ''}’)"
+
+    def _metacognitive_prompt(self, state: DialogueState) -> str:
+        opts = [
+            "what strategy just worked for you and why",
+            "what you might try next if this path stalls",
+            "how you would explain your idea to a classmate",
+        ]
+        return f"take 20 seconds to articulate {random.choice(opts)}."
+
+    def _truncate(self, s: str) -> str:
+        return s if len(s) <= self.max_len else s[: self.max_len - 1] + "…"
+
+    # --------------- Adaptivity controls -----------------
+    def adjust_difficulty(self, state: DialogueState, student_signal: str):
+        """Very simple adaptation: raise on confidence+correctness, lower on confusion."""
+        text = student_signal.lower()
+        if re.search(r"i (think|feel).*(right|correct|makes sense)", text):
+            state.difficulty = min(5, state.difficulty + 1)
+        elif re.search(r"i (don\'t|do not) (know|get|understand)", text) or re.search(r"stuck|confus", text):
+            state.difficulty = max(1, state.difficulty - 1)
+        # else unchanged
+
+    # --------------- Safety: avoid leaking answers -----------------
+    @staticmethod
+    def is_open_ended(q: str) -> bool:
+        return q.strip().endswith('?') and any(q.lower().startswith(v) for v in BLOOM_OPENERS)
+
+    @staticmethod
+    def leaks_numeric_answer(q: str) -> bool:
+        # Heuristic: question that contains 'the answer is' or an equals with a single number token
+        if re.search(r"the answer is\\b", q, re.I):
+            return True
+        if re.search(r"=\\s*[-+]?\\d+(?:\\.\\d+)?\\b", q):
+            return True
+        return False
+
+# =========================== Tests ===========================
+class TestSocraticTutor(unittest.TestCase):
+    def setUp(self):
+        random.seed(42)
+        self.tutor = SocraticTutor(max_len=200)
+
+    def test_open_ended(self):
+        st = DialogueState(topic="algebra", difficulty=2)
+        q = self.tutor.generate_question(st)
+        self.assertTrue(SocraticTutor.is_open_ended(q), q)
+        self.assertTrue(q.endswith("?"))
+
+    def test_no_answer_leakage(self):
+        st = DialogueState(topic="statistics", difficulty=3)
+        q = self.tutor.generate_question(st)
+        self.assertFalse(SocraticTutor.leaks_numeric_answer(q), q)
+        self.assertNotRegex(q.lower(), r"the answer is")
+
+    def test_adaptive_difficulty_up(self):
+        st = DialogueState(topic="physics", difficulty=2)
+        self.tutor.adjust_difficulty(st, "I think this is correct and it makes sense now.")
+        self.assertEqual(st.difficulty, 3)
+
+    def test_adaptive_difficulty_down(self):
+        st = DialogueState(topic="calculus", difficulty=4)
+        self.tutor.adjust_difficulty(st, "I'm stuck and confused – I don't understand limits.")
+        self.assertEqual(st.difficulty, 3)
+
+    def test_followup_uses_student_context(self):
+        st = DialogueState(topic="algebra", difficulty=2)
+        st.push("student", "y = 2x + 3 so the slope is 2")
+        q = self.tutor.generate_question(st)
+        self.assertIn("connect each calculation", q)
+
+    def test_metacognitive_every_third(self):
+        st = DialogueState(topic="algebra", difficulty=2)
+        q1 = self.tutor.generate_question(st)
+        q2 = self.tutor.generate_question(st)
+        q3 = self.tutor.generate_question(st)
+        self.assertRegex(q3.lower(), r"take 20 seconds|strategy|classmate")
+
+    def test_truncation(self):
+        t = SocraticTutor(max_len=50)
+        st = DialogueState(topic="physics", difficulty=5)
+        q = t.generate_question(st)
+        self.assertLessEqual(len(q), 50)
+
+if __name__ == "__main__":
+    # Demo run: generate a short exchange then execute tests
+    demo = DialogueState(topic="algebra", difficulty=2)
+    tut = SocraticTutor()
+    for _ in range(3):
+        q = tut.generate_question(demo)
+        print("TUTOR:", q)
+        demo.push("tutor", q)
+        student = input("STUDENT (type a brief reply): ") or "I'm not sure."
+        demo.push("student", student)
+        tut.adjust_difficulty(demo, student)
+    print("\nRunning unit tests...\n")
+    unittest.main(argv=["-m", "unittest", "discover", "-v"], exit=False)
 1
